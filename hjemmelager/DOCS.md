@@ -37,6 +37,8 @@ Home Assistant krever at et add-on-repository har `repository.yaml` i roten, og 
 
 Lagerforsiden viser antall varer, hva som må kjøpes, varer med nær best før og siste endring. **Historikk** under **Mer** viser hva som har skjedd og åpner varen slik at feil kan rettes.
 
+På **Handleliste** kan du endre **Kjøpt antall** før eller etter at varen legges i kurven. Avhukningen betyr bare at varen er plukket; lageret endres ikke før du trykker **Bekreft handel**. Da legges de valgte mengdene samlet inn på lageret og registreres i historikken. Hvis en vare ikke skal komme automatisk på innkjøpslisten, sveiper du den mot venstre og trykker **Fjern**. Innkjøp kan senere slås på igjen inne på varen.
+
 **Kort** er arbeidsvisningen med hurtigknapper for antall. **Liste** er en tettere oversikt uten `+` og `−`; trykk på en rad for å åpne varen og gjøre endringer.
 
 Lageroversikten viser bare varer og gjenstander som faktisk har beholdning. En forbruksvare blir stående så lenge den har minst én uåpnet eller åpnet pakke. Når begge antall er 0, forsvinner den fra oversikten, men beholdes i Hjemmelager. Den kan fortsatt finnes med navnesøk og vises på handlelisten når varsling og innkjøp er slått på. Slå på **Vis også tomme varer** under filtre for å se dem sammen med resten, for eksempel etter at du har åpnet en bestemt plassering via **Mer**.
@@ -110,8 +112,8 @@ Kamera i nettleseren krever normalt HTTPS. Bruk for eksempel Home Assistant Clou
 Flyt:
 
 1. Åpne **Scan** fra toppmenyen.
-2. Trykk **Skann med kamera**.
-3. Scan QR-kode eller strekkode.
+2. Kameraet starter automatisk. Gi nettleseren kameratilgang hvis du blir spurt; bruk **Start kamera på nytt** hvis oppstarten stoppes.
+3. Hold QR-koden eller strekkoden rolig i kamerabildet. Skanneren prøver vanlig, liggende og opp-ned retning.
 4. Hvis koden finnes på en vare, åpnes varen.
 5. Hvis koden er ukjent, åpnes ny vare med koden ferdig utfylt.
 6. For vanlige produktstrekkoder forsøker Hjemmelager å hente navn, merke, produktbilde og næringsinnhold fra Open Food Facts. Hvis produktet eller nettet ikke er tilgjengelig, fylles varen inn manuelt som før.
@@ -289,7 +291,7 @@ Hver godkjente versjon skal ha både versjonsnummer og kodenavn.
 Gjeldende versjon er:
 
 ```text
-1.4.10 - Kompakte filtre
+1.4.12 - Sveip og skann
 ```
 
 Kontroller installert versjon på én av disse måtene:

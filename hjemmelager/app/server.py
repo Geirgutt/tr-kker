@@ -27,8 +27,8 @@ except ImportError:
 
 
 APP_NAME = "Hjemmelager"
-APP_VERSION = "1.4.10"
-APP_CODENAME = "Kompakte filtre"
+APP_VERSION = "1.4.12"
+APP_CODENAME = "Sveip og skann"
 TAG_LINK_TTL_SECONDS = 180
 DATA_DIR = Path(os.environ.get("HJEMMELAGER_DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "hjemmelager.db"
@@ -84,6 +84,7 @@ BACKUP_ITEM_COLUMNS = (
     "note",
     "shopping_enabled",
     "shopping_checked",
+    "shopping_quantity",
     "last_scanned_at",
     "created_at",
     "updated_at",
@@ -362,6 +363,7 @@ def init_db():
                 note text not null default '',
                 shopping_enabled integer not null default 1,
                 shopping_checked integer not null default 0,
+                shopping_quantity real not null default 0,
                 last_scanned_at integer,
                 created_at integer not null,
                 updated_at integer not null
@@ -466,6 +468,8 @@ def init_db():
             )
         if "shopping_checked" not in columns:
             conn.execute("alter table items add column shopping_checked integer not null default 0")
+        if "shopping_quantity" not in columns:
+            conn.execute("alter table items add column shopping_quantity real not null default 0")
         for table, column in (("locations", "location"), ("categories", "category")):
             values = conn.execute(
                 f"select distinct trim({column}) as name from items where trim({column}) != ''"
@@ -681,6 +685,7 @@ EVENT_LABELS = {
     "package_action_undone": "pakkehandling angret",
     "expiry_batch_added": "holdbarhetsparti lagt til",
     "expiry_date_removed": "holdbarhetsdato fjernet",
+    "shopping_purchased": "kjøpt og lagt på lager",
     "tag_linked": "NFC-tag koblet",
     "tag_unlinked": "NFC-tag fjernet",
     "deletion_undone": "sletting angret",
@@ -858,6 +863,7 @@ def restore_backup_payload(payload):
         "note": "",
         "shopping_enabled": 1,
         "shopping_checked": 0,
+        "shopping_quantity": 0,
         "last_scanned_at": None,
         "created_at": now(),
         "updated_at": now(),
@@ -1554,7 +1560,7 @@ def update_item(item_id, data):
                 name = ?, kind = ?, quantity = ?, opened_quantity = ?, unit = ?, min_quantity = ?, target_quantity = ?,
                 price = ?, best_before = ?, expiry_batches_json = ?,
                 location = ?, category = ?, tag_id = ?, barcode = ?, nutrition_json = ?, image_url = ?, note = ?,
-                shopping_enabled = ?, shopping_checked = 0, updated_at = ?
+                shopping_enabled = ?, shopping_checked = 0, shopping_quantity = 0, updated_at = ?
             where id = ?
             """,
             (
@@ -1613,6 +1619,7 @@ def adjust_item(item_id, delta, note=""):
                 best_before = ?,
                 expiry_batches_json = ?,
                 shopping_checked = case when ? > 0 then 0 else shopping_checked end,
+                shopping_quantity = case when ? > 0 then 0 else shopping_quantity end,
                 updated_at = ?
             where id = ?
             """,
@@ -1620,6 +1627,7 @@ def adjust_item(item_id, delta, note=""):
                 quantity,
                 earliest_best_before(expiry_batches),
                 serialize_expiry_batches(expiry_batches),
+                actual_delta,
                 actual_delta,
                 now(),
                 item_id,
@@ -1670,7 +1678,7 @@ def add_expiry_batch(
             """
             update items
             set quantity = ?, best_before = ?, expiry_batches_json = ?,
-                shopping_checked = 0, updated_at = ?
+                shopping_checked = 0, shopping_quantity = 0, updated_at = ?
             where id = ?
             """,
             (
@@ -1825,15 +1833,34 @@ def deletion_notice(deletion_id):
     """
 
 
-def set_shopping_checked(item_id, checked):
+def suggested_shopping_quantity(item):
+    target = float(item["target_quantity"] or 0)
+    if target <= 0:
+        target = float(item["min_quantity"] or 0)
+    return max(1, target - float(item["quantity"] or 0))
+
+
+def set_shopping_checked(item_id, checked, quantity=None):
     with db() as conn:
         row = conn.execute("select * from items where id = ?", (item_id,)).fetchone()
         if not row:
             return None
         value = 1 if checked else 0
+        stored_quantity = float(row["shopping_quantity"] or 0)
+        if checked:
+            submitted_quantity = parse_float(quantity, stored_quantity)
+            stored_quantity = (
+                submitted_quantity
+                if submitted_quantity > 0
+                else suggested_shopping_quantity(row)
+            )
         conn.execute(
-            "update items set shopping_checked = ?, updated_at = ? where id = ?",
-            (value, now(), item_id),
+            """
+            update items
+            set shopping_checked = ?, shopping_quantity = ?, updated_at = ?
+            where id = ?
+            """,
+            (value, stored_quantity, now(), item_id),
         )
         save_event(
             conn,
@@ -1846,6 +1873,61 @@ def set_shopping_checked(item_id, checked):
     return get_item(item_id)
 
 
+def set_shopping_quantity(item_id, quantity):
+    with db() as conn:
+        row = conn.execute("select * from items where id = ?", (item_id,)).fetchone()
+        if not row:
+            return None
+        value = parse_float(quantity, row["shopping_quantity"])
+        if value <= 0:
+            value = suggested_shopping_quantity(row)
+        conn.execute(
+            "update items set shopping_quantity = ?, updated_at = ? where id = ?",
+            (value, now(), item_id),
+        )
+    return get_item(item_id)
+
+
+def confirm_shopping_purchase(quantities=None):
+    quantities = quantities or {}
+    purchased = []
+    with db() as conn:
+        rows = conn.execute(
+            "select * from items where shopping_checked = 1 order by id"
+        ).fetchall()
+        for row in rows:
+            override = quantities.get(str(row["id"]))
+            amount = parse_float(override, row["shopping_quantity"])
+            if amount <= 0:
+                amount = suggested_shopping_quantity(row)
+            if amount <= 0:
+                continue
+            quantity_after = float(row["quantity"] or 0) + amount
+            conn.execute(
+                """
+                update items
+                set quantity = ?, shopping_checked = 0, shopping_quantity = 0,
+                    updated_at = ?
+                where id = ?
+                """,
+                (quantity_after, now(), row["id"]),
+            )
+            save_event(
+                conn,
+                row["id"],
+                "shopping_purchased",
+                amount,
+                quantity_after,
+                "web",
+            )
+            purchased.append(
+                {"id": row["id"], "name": row["name"], "quantity": amount}
+            )
+    if purchased:
+        request_home_assistant_alert_publish()
+    return purchased
+
+
 def set_shopping_enabled(item_id, enabled):
     with db() as conn:
         row = conn.execute("select * from items where id = ?", (item_id,)).fetchone()
@@ -1854,7 +1936,8 @@ def set_shopping_enabled(item_id, enabled):
         conn.execute(
             """
             update items
-            set shopping_enabled = ?, shopping_checked = 0, updated_at = ?
+            set shopping_enabled = ?, shopping_checked = 0, shopping_quantity = 0,
+                updated_at = ?
             where id = ?
             """,
             (1 if enabled else 0, now(), item_id),
@@ -1952,6 +2035,8 @@ def restore_deleted_item(deletion_id):
             tuple(
                 restored_expiry_batches
                 if column == "expiry_batches_json"
+                else item.get(column, 0)
+                if column == "shopping_quantity"
                 else item.get(column, "{}")
                 if column == "nutrition_json"
                 else item.get(column)
@@ -3766,9 +3851,39 @@ def page(title, body, base_path=""):
     .shopping-group-count {{
       color: var(--accent);
     }}
-    .shopping-row {{
+    .shopping-swipe-hint {{
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: .78rem;
+    }}
+    .shopping-swipe {{
+      position: relative;
+      overflow: hidden;
+      border-radius: 10px;
+      background: var(--danger);
+    }}
+    .shopping-remove-form {{
+      position: absolute;
+      inset: 0 0 0 auto;
       display: grid;
-      grid-template-columns: 30px 36px minmax(0, 1fr);
+      width: 94px;
+    }}
+    .shopping-remove {{
+      width: 100%;
+      padding: 8px;
+      border: 0;
+      color: white;
+      background: var(--danger);
+      cursor: pointer;
+      font: inherit;
+      font-size: .78rem;
+      font-weight: 850;
+    }}
+    .shopping-row {{
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: 30px 36px minmax(0, 1fr) auto;
       gap: 8px;
       align-items: center;
       padding: 7px 8px;
@@ -3776,6 +3891,11 @@ def page(title, body, base_path=""):
       border-radius: 10px;
       background: var(--panel);
       box-shadow: var(--shadow-sm);
+      touch-action: pan-y;
+      transition: transform .18s ease;
+    }}
+    .shopping-swipe.revealed .shopping-row {{
+      transform: translateX(-94px);
     }}
     .shopping-row.checked {{
       opacity: .62;
@@ -3804,6 +3924,9 @@ def page(title, body, base_path=""):
       stroke-linecap: round;
       stroke-linejoin: round;
       stroke-width: 2.5;
+    }}
+    .shopping-check-form {{
+      display: contents;
     }}
     .shopping-thumb {{
       width: 36px;
@@ -3844,6 +3967,60 @@ def page(title, body, base_path=""):
       line-height: 1.15;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }}
+    .shopping-pick {{
+      display: grid;
+      gap: 2px;
+      justify-items: end;
+      color: var(--muted);
+      font-size: .7rem;
+      font-weight: 750;
+    }}
+    .shopping-quantity-form {{
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }}
+    .shopping-quantity-form input {{
+      width: 62px;
+      min-height: 34px;
+      padding: 5px 6px;
+      border-radius: 8px;
+      text-align: center;
+      font-size: .88rem;
+      font-weight: 750;
+    }}
+    .shopping-quantity-save {{
+      display: grid;
+      place-items: center;
+      min-width: 34px;
+      min-height: 34px;
+      padding: 4px 7px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--accent);
+      background: var(--panel);
+      cursor: pointer;
+      font-weight: 850;
+    }}
+    .shopping-confirm {{
+      position: sticky;
+      bottom: calc(68px + env(safe-area-inset-bottom));
+      z-index: 4;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 12px;
+      padding: 10px;
+      border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--panel) 94%, var(--accent));
+      box-shadow: var(--shadow);
+    }}
+    .shopping-confirm p {{
+      margin: 0;
+      font-size: .82rem;
     }}
     .shopping-completed {{
       margin-top: 14px;
@@ -6924,10 +7101,10 @@ def scan_page(location=""):
       <div class="card stack">
         <video id="scanner-video" class="scanner" playsinline muted></video>
         <div class="actions">
-          <button id="start-scan" class="btn primary" type="button">Skann med kamera</button>
+          <button id="start-scan" class="btn primary" type="button">Start kamera på nytt</button>
           <button id="stop-scan" class="btn" type="button">Stopp</button>
         </div>
-        <p id="scan-status" class="muted">Trykk «Skann med kamera» og hold strekkoden rolig i bildet – stående eller liggende.</p>
+        <p id="scan-status" class="muted">Starter kamera – hold strekkoden rolig; alle retninger støttes.</p>
         <details class="scanner-diagnostics-wrap">
           <summary>Feilsøking</summary>
           <dl id="scanner-diagnostics" class="scanner-diagnostics" aria-live="polite"></dl>
@@ -6954,8 +7131,10 @@ def scan_page(location=""):
       let codeReader = null;
       let scannerControls = null;
       let rotatedDecodeTimer = null;
+      let rotatedDecodeIndex = 0;
       let hasScanned = false;
       const rotatedFrame = document.createElement('canvas');
+      const extraScanAngles = [Math.PI / 2, Math.PI, Math.PI * 1.5];
       const diagnosticsEl = document.getElementById('scanner-diagnostics');
       const diagnostics = {
         secureContext: window.isSecureContext,
@@ -7031,15 +7210,20 @@ def scan_page(location=""):
         const scale = Math.min(1, 1280 / Math.max(sourceWidth, sourceHeight));
         const frameWidth = Math.round(sourceWidth * scale);
         const frameHeight = Math.round(sourceHeight * scale);
-        if (rotatedFrame.width !== frameHeight) rotatedFrame.width = frameHeight;
-        if (rotatedFrame.height !== frameWidth) rotatedFrame.height = frameWidth;
+        const angle = extraScanAngles[rotatedDecodeIndex % extraScanAngles.length];
+        rotatedDecodeIndex += 1;
+        const swapsSides = Math.abs(Math.sin(angle)) > 0.5;
+        const canvasWidth = swapsSides ? frameHeight : frameWidth;
+        const canvasHeight = swapsSides ? frameWidth : frameHeight;
+        if (rotatedFrame.width !== canvasWidth) rotatedFrame.width = canvasWidth;
+        if (rotatedFrame.height !== canvasHeight) rotatedFrame.height = canvasHeight;
         const context = rotatedFrame.getContext('2d', { willReadFrequently: true });
         if (!context) return;
 
         context.setTransform(1, 0, 0, 1, 0, 0);
         context.clearRect(0, 0, rotatedFrame.width, rotatedFrame.height);
-        context.translate(frameHeight / 2, frameWidth / 2);
-        context.rotate(Math.PI / 2);
+        context.translate(canvasWidth / 2, canvasHeight / 2);
+        context.rotate(angle);
         context.drawImage(
           video,
           -frameWidth / 2,
@@ -7058,7 +7242,8 @@ def scan_page(location=""):
 
       function startRotatedDecoding() {
         if (rotatedDecodeTimer) window.clearInterval(rotatedDecodeTimer);
-        rotatedDecodeTimer = window.setInterval(decodeRotatedFrame, 350);
+        rotatedDecodeIndex = 0;
+        rotatedDecodeTimer = window.setInterval(decodeRotatedFrame, 250);
       }
 
       function openCode(rawCode) {
@@ -7129,7 +7314,7 @@ def scan_page(location=""):
           }
           const deviceId = chooseCamera(videoInputs);
           codeReader = codeReader || new ZXingBrowser.BrowserMultiFormatReader(scannerHints);
-          setStatus('Kamera startet – hold strekkoden rolig, stående eller liggende');
+          setStatus('Kamera startet – hold strekkoden rolig; alle retninger støttes');
           scannerControls = await codeReader.decodeFromVideoDevice(
             deviceId,
             video,
@@ -7160,6 +7345,8 @@ def scan_page(location=""):
       renderDiagnostics();
       if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
         setStatus('Kamera krever en sikker HTTPS-tilkobling. Du kan fortsatt skrive inn koden manuelt.');
+      } else {
+        window.setTimeout(() => void startScan(), 0);
       }
     </script>
     """
@@ -7170,7 +7357,7 @@ def scan_page(location=""):
     )
 
 
-def shopping_list_page():
+def shopping_list_page(purchased_count=0, removed_count=0):
     items = list_items(LOW_STOCK_WHERE)
     remaining = [item for item in items if not item["shopping_checked"]]
     completed = [item for item in items if item["shopping_checked"]]
@@ -7180,8 +7367,11 @@ def shopping_list_page():
         target = float(item["target_quantity"] or 0)
         if target <= 0:
             target = float(item["min_quantity"])
-        amount = max(1, target - float(item["quantity"]))
-        amount_text = f"{fmt_num(amount)} {esc(item['unit'])}"
+        suggested_amount = suggested_shopping_quantity(item)
+        selected_amount = float(item["shopping_quantity"] or 0)
+        if selected_amount <= 0:
+            selected_amount = suggested_amount
+        amount_text = f"{fmt_num(selected_amount)} {esc(item['unit'])}"
         meta = " · ".join(
             filter(
                 None,
@@ -7202,20 +7392,40 @@ def shopping_list_page():
         next_value = "0" if checked else "1"
         action_label = "Fjern avkrysning" if checked else "Legg i kurven"
         return f"""
-          <form class="shopping-row {"checked" if checked else ""}" method="post"
-                action="item/{item['id']}/shopping-check"
-                data-copy="{esc(amount_text)} {esc(item['name'])}">
-            <input type="hidden" name="checked" value="{next_value}">
-            <button class="shopping-check" aria-label="{action_label}: {esc(item['name'])}">
-              <svg viewBox="0 0 24 24" aria-hidden="true">{checkmark}</svg>
-            </button>
+          <div class="shopping-swipe">
+            <form class="shopping-remove-form" method="post"
+                  action="item/{item['id']}/shopping-remove">
+              <button class="shopping-remove"
+                      aria-label="Fjern {esc(item['name'])} fra innkjøpslisten">Fjern</button>
+            </form>
+            <article class="shopping-row {"checked" if checked else ""}"
+                     data-item-id="{item['id']}"
+                     data-copy="{esc(amount_text)} {esc(item['name'])}">
+            <form class="shopping-check-form" method="post"
+                  action="item/{item['id']}/shopping-check">
+              <input type="hidden" name="checked" value="{next_value}">
+              <button class="shopping-check" aria-label="{action_label}: {esc(item['name'])}">
+                <svg viewBox="0 0 24 24" aria-hidden="true">{checkmark}</svg>
+              </button>
+            </form>
             {thumb}
             <div class="shopping-copy">
               <p class="shopping-name">{esc(item['name'])}</p>
-              <div class="shopping-amount">Kjøp {amount_text}</div>
+              <div class="shopping-amount">Forslag {fmt_num(suggested_amount)} {esc(item['unit'])}</div>
               <div class="shopping-meta">{esc(meta)}</div>
             </div>
-          </form>
+            <div class="shopping-pick">
+              <span>Kjøpt antall</span>
+              <form class="shopping-quantity-form" method="post"
+                    action="item/{item['id']}/shopping-quantity">
+                <input name="quantity" type="number" min="0.01" step="any"
+                       inputmode="decimal" value="{fmt_num(selected_amount)}"
+                       aria-label="Kjøpt antall for {esc(item['name'])}">
+                <button class="shopping-quantity-save" aria-label="Lagre kjøpt antall for {esc(item['name'])}">Lagre</button>
+              </form>
+            </div>
+            </article>
+          </div>
         """
 
     def grouped_rows(group_items):
@@ -7253,7 +7463,7 @@ def shopping_list_page():
         )
         completed_content = (
             f"""
-              <details class="shopping-completed">
+              <details class="shopping-completed" open>
                 <summary>I kurven ({len(completed)})</summary>
                 <section class="shopping-list">{completed_html}</section>
               </details>
@@ -7261,14 +7471,55 @@ def shopping_list_page():
             if completed_html
             else ""
         )
-        list_content = open_content + completed_content
+        confirm_content = (
+            f"""
+              <form class="shopping-confirm" id="confirm-shopping" method="post"
+                    action="shopping/confirm">
+                <p><strong>{len(completed)} i kurven</strong><br>
+                  Lageret endres først når handelen bekreftes.</p>
+                <button class="btn primary">Bekreft handel</button>
+              </form>
+            """
+            if completed
+            else ""
+        )
+        list_content = open_content + completed_content + confirm_content
 
     share_button = (
         '<button class="btn" id="share-shopping" type="button">Del liste</button>'
         if remaining
         else ""
     )
+    purchase_notice = (
+        f"""
+          <section class="created-notice">
+            <span class="created-check" aria-hidden="true">✓</span>
+            <h2>Handelen er lagt på lageret</h2>
+            <p class="muted">{int(purchased_count)} {"vare" if int(purchased_count) == 1 else "varer"} ble oppdatert.</p>
+          </section>
+        """
+        if int(purchased_count or 0) > 0
+        else ""
+    )
+    removed_notice = (
+        """
+          <section class="created-notice">
+            <span class="created-check" aria-hidden="true">✓</span>
+            <h2>Varen er fjernet fra innkjøpslisten</h2>
+            <p class="muted">Automatisk innkjøp er slått av. Det kan slås på igjen inne på varen.</p>
+          </section>
+        """
+        if int(removed_count or 0) > 0
+        else ""
+    )
+    swipe_hint = (
+        '<p class="shopping-swipe-hint">Sveip en vare mot venstre og trykk <strong>Fjern</strong> for å slå av automatisk innkjøp.</p>'
+        if items
+        else ""
+    )
     return f"""
+      {purchase_notice}
+      {removed_notice}
       <section class="shopping-header">
         <div>
           <h1>Handleliste</h1>
@@ -7276,6 +7527,7 @@ def shopping_list_page():
         </div>
         {share_button}
       </section>
+      {swipe_hint}
       {list_content}
       <script>
         const shareButton = document.getElementById("share-shopping");
@@ -7295,6 +7547,80 @@ def shopping_list_page():
               shareButton.textContent = "Kunne ikke dele";
             }}
           }}
+        }});
+
+        document.querySelectorAll(".shopping-check-form").forEach((form) => {{
+          form.addEventListener("submit", () => {{
+            const row = form.closest(".shopping-row");
+            const quantity = row?.querySelector('.shopping-quantity-form input[name="quantity"]');
+            if (!quantity) return;
+            const hidden = document.createElement("input");
+            hidden.type = "hidden";
+            hidden.name = "quantity";
+            hidden.value = quantity.value;
+            form.append(hidden);
+          }});
+        }});
+
+        let revealedSwipe = null;
+        const setSwipeRevealed = (container, revealed) => {{
+          if (revealedSwipe && revealedSwipe !== container) {{
+            revealedSwipe.classList.remove("revealed");
+          }}
+          container.classList.toggle("revealed", revealed);
+          revealedSwipe = revealed ? container : null;
+        }};
+
+        document.querySelectorAll(".shopping-swipe").forEach((container) => {{
+          const row = container.querySelector(".shopping-row");
+          const removeButton = container.querySelector(".shopping-remove");
+          let startX = 0;
+          let startY = 0;
+          let tracking = false;
+
+          row.addEventListener("pointerdown", (event) => {{
+            if (event.pointerType === "mouse" && event.button !== 0) return;
+            if (event.target.closest("button, input")) return;
+            startX = event.clientX;
+            startY = event.clientY;
+            tracking = true;
+          }});
+          row.addEventListener("pointerup", (event) => {{
+            if (!tracking) return;
+            tracking = false;
+            const deltaX = event.clientX - startX;
+            const deltaY = event.clientY - startY;
+            if (Math.abs(deltaX) < 45 || Math.abs(deltaX) <= Math.abs(deltaY)) return;
+            setSwipeRevealed(container, deltaX < 0);
+          }});
+          row.addEventListener("pointercancel", () => {{ tracking = false; }});
+          removeButton.addEventListener("focus", () => setSwipeRevealed(container, true));
+          container.addEventListener("keydown", (event) => {{
+            if (event.key === "Escape") setSwipeRevealed(container, false);
+          }});
+        }});
+
+        document.addEventListener("pointerdown", (event) => {{
+          if (revealedSwipe && !revealedSwipe.contains(event.target)) {{
+            setSwipeRevealed(revealedSwipe, false);
+          }}
+        }});
+
+        const confirmShopping = document.getElementById("confirm-shopping");
+        confirmShopping?.addEventListener("submit", (event) => {{
+          if (!window.confirm("Legg alle varer i kurven inn på lageret?")) {{
+            event.preventDefault();
+            return;
+          }}
+          document.querySelectorAll(".shopping-row.checked").forEach((row) => {{
+            const quantity = row.querySelector('.shopping-quantity-form input[name="quantity"]');
+            if (!quantity) return;
+            const hidden = document.createElement("input");
+            hidden.type = "hidden";
+            hidden.name = "quantity_" + row.dataset.itemId;
+            hidden.value = quantity.value;
+            confirmShopping.append(hidden);
+          }});
         }});
       </script>
     """
@@ -7340,8 +7666,8 @@ def help_page():
                 "Strekkode og QR",
                 "Kamera, manuelt søk og produktdata",
                 (
-                    "Trykk Skann med kamera og gi nettleseren kameratilgang.",
-                    "Hold strekkoden rolig og godt belyst til koden blir lest.",
+                    "Kameraet starter automatisk. Gi nettleseren kameratilgang når du blir spurt.",
+                    "Hold strekkoden rolig og godt belyst. Den leses også liggende og opp ned.",
                     "Skriv inn koden manuelt dersom kameraet ikke er tilgjengelig.",
                     "Kontroller forslaget fra Open Food Facts før varen lagres.",
                 ),
@@ -7411,7 +7737,10 @@ def help_page():
                     "Varsle ved antall bestemmer når varen kommer på handlelisten; 0 betyr når ingen uåpnede pakker er igjen.",
                     "Checkboxen for handlelisten slår varsling for varen helt av eller på.",
                     "Fyll opp til bestemmer hvor mye Hjemmelager foreslår at du kjøper.",
-                    "Kryss av varer mens du handler, eller del listen fra telefonen.",
+                    "Velg faktisk kjøpt antall og kryss av varen når den ligger i kurven.",
+                    "Trykk Bekreft handel for å legge alle avhukede mengder inn på lageret.",
+                    "Sveip en vare mot venstre og trykk Fjern for å slå av automatisk innkjøp for varen.",
+                    "Du kan også dele de gjenstående varene fra telefonen.",
                     "Deaktiver handleliste på varer du ikke ønsker varsling for.",
                 ),
                 "low-stock",
@@ -8124,7 +8453,20 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "low-stock":
-            self.send_html("Lav beholdning", shopping_list_page())
+            query = parse_qs(urlparse(self.path).query)
+            purchased_count = int(
+                parse_float((query.get("purchased") or ["0"])[0])
+            )
+            removed_count = int(
+                parse_float((query.get("removed") or ["0"])[0])
+            )
+            self.send_html(
+                "Lav beholdning",
+                shopping_list_page(
+                    purchased_count=purchased_count,
+                    removed_count=removed_count,
+                ),
+            )
             return
 
         if path.startswith("location/"):
@@ -8570,6 +8912,16 @@ class Handler(BaseHTTPRequestHandler):
             self.redirect(new_item_redirect(item, data))
             return
 
+        if path == "shopping/confirm":
+            quantities = {
+                key.removeprefix("quantity_"): value
+                for key, value in data.items()
+                if key.startswith("quantity_")
+            }
+            purchased = confirm_shopping_purchase(quantities)
+            self.redirect(f"low-stock?purchased={len(purchased)}")
+            return
+
         if path == "organize":
             create_registry_entry(data.get("kind"), data.get("name"))
             self.redirect("organize")
@@ -8711,7 +9063,16 @@ class Handler(BaseHTTPRequestHandler):
                 set_shopping_checked(
                     int(parts[1]),
                     str(data.get("checked", "0")).lower() in ("1", "true", "on", "yes"),
+                    data.get("quantity"),
                 )
+                self.redirect("low-stock")
+                return
+            if len(parts) == 3 and parts[2] == "shopping-remove" and parts[1].isdigit():
+                set_shopping_enabled(int(parts[1]), False)
+                self.redirect("low-stock?removed=1")
+                return
+            if len(parts) == 3 and parts[2] == "shopping-quantity" and parts[1].isdigit():
+                set_shopping_quantity(int(parts[1]), data.get("quantity"))
                 self.redirect("low-stock")
                 return
             if len(parts) == 3 and parts[2] == "edit" and parts[1].isdigit():

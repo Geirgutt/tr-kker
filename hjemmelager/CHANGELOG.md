@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.12 - Sveip og skann
+
+- Leser strekkoder eksplisitt i 90°, 180° og 270° i tillegg til vanlig retning.
+- Lar deg sveipe en vare mot venstre på handlelisten og slå av automatisk innkjøp.
+- Viser en forklaring etter at en vare er fjernet fra innkjøpslisten.
+
+## 1.4.11 - Fra kurv til lager
+
+- Lar deg velge faktisk kjøpt antall for hver vare på handlelisten.
+- Legger avhukede varer samlet inn på lageret med **Bekreft handel**.
+- Starter kameraet automatisk når Scan-siden åpnes, med en knapp for å prøve på nytt.
+
 ## 1.4.10 - Kompakte filtre
 
 - Hold avhukningen for «Vis også tomme varer» og teksten på samme linje.

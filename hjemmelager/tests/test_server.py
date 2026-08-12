@@ -296,7 +296,8 @@ class HjemmelagerTests(unittest.TestCase):
             target_quantity="10",
         )
         page = self.app.shopping_list_page()
-        self.assertIn("Kjøp 8 stk", page)
+        self.assertIn("Forslag 8 stk", page)
+        self.assertIn('value="8"', page)
         self.assertIn("Mål 10", page)
 
         self.app.set_shopping_enabled(item["id"], False)
@@ -320,7 +321,7 @@ class HjemmelagerTests(unittest.TestCase):
         self.assertEqual(opened["opened_quantity"], 1)
         self.assertTrue(opened["is_low"])
         self.assertIn("Kulturmelk", self.app.shopping_list_page())
-        self.assertIn("Kjøp 2 stk", self.app.shopping_list_page())
+        self.assertIn("Forslag 2 stk", self.app.shopping_list_page())
         self.assertEqual(self.app.create_alerts_payload()["summary"]["low_stock"], 1)
 
         self.app.set_shopping_enabled(item["id"], False)
@@ -355,6 +356,52 @@ class HjemmelagerTests(unittest.TestCase):
         self.assertIn("Meieri", content)
         self.assertIn("Husholdning", content)
         self.assertIn('class="shopping-groups"', content)
+
+    def test_confirmed_shopping_adds_selected_quantity_to_stock(self):
+        item = self.create_item(
+            "Melk",
+            quantity="2",
+            min_quantity="3",
+            target_quantity="10",
+        )
+
+        checked = self.app.set_shopping_checked(item["id"], True, "6")
+        page = self.app.shopping_list_page()
+        purchased = self.app.confirm_shopping_purchase({str(item["id"]): "7"})
+        updated = self.app.get_item(item["id"])
+
+        self.assertEqual(checked["shopping_quantity"], 6)
+        self.assertIn("Kjøpt antall", page)
+        self.assertIn('<details class="shopping-completed" open>', page)
+        self.assertIn("Bekreft handel", page)
+        self.assertIn('class="shopping-swipe"', page)
+        self.assertIn(f'item/{item["id"]}/shopping-remove', page)
+        self.assertIn("Sveip en vare mot venstre", page)
+        self.assertEqual(purchased[0]["quantity"], 7)
+        self.assertEqual(updated["quantity"], 9)
+        self.assertEqual(updated["shopping_checked"], 0)
+        self.assertEqual(updated["shopping_quantity"], 0)
+        self.assertEqual(self.app.recent_events(1)[0]["action"], "shopping_purchased")
+
+    def test_swipe_remove_turns_off_automatic_shopping(self):
+        item = self.create_item(
+            "Melk",
+            quantity="0",
+            min_quantity="1",
+        )
+        page = self.app.page("Handleliste", self.app.shopping_list_page())
+
+        self.assertIn("touch-action: pan-y", page)
+        self.assertIn('row.addEventListener("pointerdown"', page)
+        self.assertIn("setSwipeRevealed(container, deltaX < 0)", page)
+        self.assertIn(f'item/{item["id"]}/shopping-remove', page)
+
+        self.app.set_shopping_enabled(item["id"], False)
+        removed_page = self.app.shopping_list_page(removed_count=1)
+
+        self.assertNotIn("Kjøpt antall for Melk", removed_page)
+        self.assertIn("Varen er fjernet fra innkjøpslisten", removed_page)
+        self.assertIn("kan slås på igjen inne på varen", removed_page)
 
     def test_search_tolerates_small_typing_errors(self):
         item = self.create_item(
@@ -1039,10 +1086,14 @@ class HjemmelagerTests(unittest.TestCase):
         self.assertIn("new Map([[zxingTryHarderHint, true]])", content)
         self.assertIn("BrowserMultiFormatReader(scannerHints)", content)
         self.assertIn("function decodeRotatedFrame()", content)
-        self.assertIn("context.rotate(Math.PI / 2)", content)
+        self.assertIn("extraScanAngles = [Math.PI / 2, Math.PI, Math.PI * 1.5]", content)
+        self.assertIn("context.rotate(angle)", content)
         self.assertIn("codeReader.decodeFromCanvas(rotatedFrame)", content)
+        self.assertIn("window.setInterval(decodeRotatedFrame, 250)", content)
         self.assertIn("startRotatedDecoding()", content)
-        self.assertIn("stående eller liggende", content)
+        self.assertIn("alle retninger støttes", content)
+        self.assertIn("window.setTimeout(() => void startScan(), 0)", content)
+        self.assertIn("Start kamera på nytt", content)
 
     def test_location_context_follows_scanner_to_new_item(self):
         location = "Kjøkken > Kjøleskap"
@@ -1108,10 +1159,10 @@ class HjemmelagerTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertEqual(self.app.APP_VERSION, "1.4.10")
-        self.assertIn('version: "1.4.10"', config)
-        self.assertIn("1.4.10 - Kompakte filtre", changelog)
-        self.assertIn("1.4.10 - Kompakte filtre", docs)
+        self.assertEqual(self.app.APP_VERSION, "1.4.12")
+        self.assertIn('version: "1.4.12"', config)
+        self.assertIn("1.4.12 - Sveip og skann", changelog)
+        self.assertIn("1.4.12 - Sveip og skann", docs)
         self.assertIn("1.4.9 - Bare det som er på lager", changelog)
         for content in (repository_config, config, docs, blueprint, server_source):
             self.assertNotIn("Geirgutt/tr-kker", content)
